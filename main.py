@@ -56,7 +56,7 @@ class UpdateResponse(BaseModel):
     time_remaining: str
     status: str
 
-# In-memory storage
+# In-memory storage (replace with database in production)
 vehicles_db = []
 
 def extract_vehicle_links(html_content: str) -> List[str]:
@@ -68,6 +68,7 @@ def extract_vehicle_links(html_content: str) -> List[str]:
         href = link.get('href')
         if href and re.search(r'/lot/\d+', href):
             text = link.get_text(strip=True)
+            # Check if it's a vehicle (starts with year) and not a motorbike
             if re.match(r'^\d{4}\b', text) and 'motorbike' not in text.lower():
                 full_url = href if href.startswith('http') else f"https://www.grays.com{href}"
                 links.add(full_url)
@@ -84,6 +85,7 @@ def extract_vehicle_details(html_content: str, url: str) -> Vehicle:
     title_parts = title.split()
     
     def get_text_by_label(label: str) -> Optional[str]:
+        """Find text next to a label"""
         for elem in soup.find_all(['li', 'div', 'span', 'td', 'th']):
             text = elem.get_text().lower()
             if label.lower() in text:
@@ -118,7 +120,7 @@ def extract_vehicle_details(html_content: str, url: str) -> Vehicle:
         url=url,
         title=title,
         make=title_parts[1] if len(title_parts) > 1 else "Unknown",
-        model=title_parts[2] if len(title_parts) > 2 else "Unknown", 
+        model=title_parts[2] if len(title_parts) > 2 else "Unknown",
         year=int(title_parts[0]) if title_parts and title_parts[0].isdigit() else None,
         variant=" ".join(title_parts[3:]) if len(title_parts) > 3 else "",
         body_type=get_text_by_label("Body Type") or "",
@@ -137,13 +139,14 @@ def extract_vehicle_details(html_content: str, url: str) -> Vehicle:
 async def root():
     return {"message": "Grays Auction Scraper API", "status": "running"}
 
-@app.post("/scrape")  # Changed from /api/scrape
+@app.post("/api/scrape")
 async def trigger_scrape():
+    global vehicles_db
     try:
         logger.info("Starting scrape process...")
         
         # Clear existing data
-        vehicles_db.clear()
+        vehicles_db = []
         
         base_url = "https://www.grays.com/search/automotive-trucks-and-marine/motor-vehiclesmotor-cycles/motor-vehicles"
         all_links = set()
@@ -166,99 +169,81 @@ async def trigger_scrape():
                 except Exception as e:
                     logger.error(f"Error on page {page}: {e}")
         
-        logger.info(f"Total links found: {len(all_links)}")
+        logger.info(f"Total unique links found: {len(all_links)}")
         
         # Process each vehicle link
-        processed = 0
+        processed_vehicles = []
+        tasks = []
+        
         async with httpx.AsyncClient(timeout=30.0) as client:
-            for url in list(all_links)[:50]:  # Limit to first 50 for testing
+            
+            async def fetch_and_process(url):
                 try:
                     response = await client.get(url, headers={
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                     })
-                    
                     if response.status_code == 200:
                         vehicle = extract_vehicle_details(response.text, url)
-                        vehicles_db.append(vehicle.dict())
-                        processed += 1
-                    
-                    await asyncio.sleep(1)  # Rate limiting
-                    
+                        return vehicle.dict()
                 except Exception as e:
                     logger.error(f"Error processing {url}: {e}")
-        
-        logger.info(f"Processed {processed} vehicles")
+                return None
+
+            for url in list(all_links)[:50]:  # Limit to first 50 for performance
+                tasks.append(fetch_and_process(url))
+
+            results = await asyncio.gather(*tasks)
+            processed_vehicles = [res for res in results if res is not None]
+
+        vehicles_db = processed_vehicles
+        logger.info(f"Processed {len(vehicles_db)} vehicles")
         
         return {
             "message": f"Scraping completed successfully",
             "found": len(all_links),
-            "processed": processed,
-            "count": len(vehicles_db)
+            "processed": len(vehicles_db)
         }
         
     except Exception as e:
         logger.error(f"Scrape failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/vehicles")  # Changed from /api/vehicles
+@app.get("/api/vehicles")
 async def get_vehicles():
     return vehicles_db
 
-@app.post("/update-listings")  # Changed from /api/update-listings
+@app.post("/api/update-listings")
 async def update_listings(request: UpdateRequest):
-
-    """Update specific vehicle listings with current price/bid data"""
-    updates = []
+    updated_vehicles = []
     
     async with httpx.AsyncClient(timeout=30.0) as client:
-        for url in request.urls[:20]:  # Limit to 20 for performance
+        
+        async def fetch_and_update(url):
             try:
                 response = await client.get(url, headers={
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                 })
-                
                 if response.status_code == 200:
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    
-                    # Extract current price
-                    price_elem = soup.find("span", attrs={"itemprop": "price"})
-                    price = None
-                    if price_elem:
-                        price_text = re.sub(r'[^\d.]', '', price_elem.get_text())
-                        price = float(price_text) if price_text else None
-                    
-                    # Extract bids
-                    bids = 0
-                    bid_link = soup.find("a", string=re.compile(r"\d+\s+bids?", re.IGNORECASE))
-                    if bid_link:
-                        bid_match = re.search(r'(\d+)', bid_link.get_text())
-                        bids = int(bid_match.group(1)) if bid_match else 0
-                    
-                    # Extract time remaining
-                    time_elem = soup.find("span", id="lot-closing-countdown")
-                    time_remaining = time_elem.get_text(strip=True) if time_elem else "Auction Ended"
-                    
-                    # Determine status
-                    status = "active"
-                    if time_remaining == "Auction Ended" or not re.search(r'\d', time_remaining):
-                        status = "sold" if price and bids > 0 else "referred"
-                    
-                    updates.append({
-                        "url": url,
-                        "price": price,
-                        "bids": bids,
-                        "time_remaining": time_remaining,
-                        "status": status
-                    })
-                
-                await asyncio.sleep(1)  # Be respectful
-                
+                    details = extract_vehicle_details(response.text, url)
+                    return UpdateResponse(
+                        url=url,
+                        price=details.price,
+                        bids=details.bids,
+                        time_remaining=details.time_remaining_or_date_sold,
+                        status=details.status
+                    ).dict()
             except Exception as e:
-                logger.error(f"Error updating {url}: {str(e)}")
-                continue
-    
-    return updates
+                logger.error(f"Failed to update {url}: {e}")
+            return None
+
+        tasks = [fetch_and_update(url) for url in request.urls]
+        results = await asyncio.gather(*tasks)
+        updated_vehicles = [res for res in results if res is not None]
+
+    return updated_vehicles
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import os
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
