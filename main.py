@@ -137,18 +137,18 @@ def extract_vehicle_details(html_content: str, url: str) -> Vehicle:
 async def root():
     return {"message": "Grays Auction Scraper API", "status": "running"}
 
-@app.post("/api/scrape")
-async def scrape_vehicles():
-    """Scrape vehicles from Grays website"""
-    logger.info("Starting vehicle scraping...")
-    
-    scraped_count = 0
-    base_url = "https://www.grays.com/search/automotive-trucks-and-marine/motor-vehiclesmotor-cycles/motor-vehicles"
-    
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            # Get vehicle links from first few pages
-            all_links = set()
+@app.post("/scrape")  # Changed from /api/scrape
+async def trigger_scrape():
+    try:
+        logger.info("Starting scrape process...")
+        
+        # Clear existing data
+        vehicles_db.clear()
+        
+        base_url = "https://www.grays.com/search/automotive-trucks-and-marine/motor-vehiclesmotor-cycles/motor-vehicles"
+        all_links = set()
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
             for page in range(1, 6):  # Scrape first 5 pages
                 try:
                     url = f"{base_url}?tab=items&isdesktop=1&page={page}"
@@ -161,14 +161,16 @@ async def scrape_vehicles():
                         all_links.update(links)
                         logger.info(f"Page {page}: Found {len(links)} links")
                     
-                    await asyncio.sleep(2)  # Be respectful
+                    await asyncio.sleep(2)  # Rate limiting
+                    
                 except Exception as e:
-                    logger.error(f"Error scraping page {page}: {str(e)}")
-                    continue
-            
-            # Now scrape individual vehicle details
-            vehicles_db.clear()  # Clear existing data
-            
+                    logger.error(f"Error on page {page}: {e}")
+        
+        logger.info(f"Total links found: {len(all_links)}")
+        
+        # Process each vehicle link
+        processed = 0
+        async with httpx.AsyncClient(timeout=30.0) as client:
             for url in list(all_links)[:50]:  # Limit to first 50 for testing
                 try:
                     response = await client.get(url, headers={
@@ -178,28 +180,33 @@ async def scrape_vehicles():
                     if response.status_code == 200:
                         vehicle = extract_vehicle_details(response.text, url)
                         vehicles_db.append(vehicle.dict())
-                        scraped_count += 1
-                        logger.info(f"Scraped: {vehicle.title}")
+                        processed += 1
                     
-                    await asyncio.sleep(1)  # Be respectful
+                    await asyncio.sleep(1)  # Rate limiting
+                    
                 except Exception as e:
-                    logger.error(f"Error scraping vehicle {url}: {str(e)}")
-                    continue
-            
-        except Exception as e:
-            logger.error(f"Scraping failed: {str(e)}")
-            raise HTTPException(status_code=500, detail=str(e))
-    
-    logger.info(f"Scraping completed. Total vehicles: {scraped_count}")
-    return {"message": f"Scraping completed", "count": scraped_count}
+                    logger.error(f"Error processing {url}: {e}")
+        
+        logger.info(f"Processed {processed} vehicles")
+        
+        return {
+            "message": f"Scraping completed successfully",
+            "found": len(all_links),
+            "processed": processed,
+            "count": len(vehicles_db)
+        }
+        
+    except Exception as e:
+        logger.error(f"Scrape failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/vehicles")
+@app.get("/vehicles")  # Changed from /api/vehicles
 async def get_vehicles():
-    """Get all scraped vehicles"""
     return vehicles_db
 
-@app.post("/api/update-listings")
+@app.post("/update-listings")  # Changed from /api/update-listings
 async def update_listings(request: UpdateRequest):
+
     """Update specific vehicle listings with current price/bid data"""
     updates = []
     
